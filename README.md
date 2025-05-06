@@ -9,7 +9,7 @@ This repository contains benchmarking tools for evaluating NATS Jetstream perfor
 
 This configuration allows for comprehensive performance testing of fan-out messaging patterns in distributed NATS Jetstream deployments. The use of ephemeral consumers ensures that subscription state is not persisted, simulating scenarios where consumers may connect and disconnect frequently.
 
-Additionally, an alternative implementation using NATS Jetstream republish functionality is available in the repository at https://github.com/hxalid/stream-benchmarks/blob/main/standalone-tests/republish/main.go. This implementation demonstrates how the republish feature can be leveraged for message routing and transformation within the NATS ecosystem.
+Additionally, an alternative implementation using NATS Jetstream republish functionality is available in the repository at https://github.com/hxalid/stream-benchmarks/blob/main/standalone-tests/republish/main.go. This implementation demonstrates how the republish feature can be leveraged for message routing and transformation.
 
 It can be executed as 
 
