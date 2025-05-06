@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
-	"runtime"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -430,185 +429,116 @@ func (b *Benchmark) startStatsReporter() {
 }
 
 func (b *Benchmark) startConsumers(topicNames []string) {
-	// If no consumers specified, use one per shard (default behavior)
 	if b.config.NumConsumers <= 0 {
 		b.config.NumConsumers = b.config.StreamShards
 	}
 
-	// Group topics by shard first
 	shardToTopics := make(map[int][]string)
 	for i, topic := range topicNames {
 		shardID := i % b.config.StreamShards
 		shardToTopics[shardID] = append(shardToTopics[shardID], topic)
 	}
 
-	// Calculate how many consumers per shard
 	consumersPerShard := make(map[int]int)
-
-	// Distribute consumers evenly across shards
-	baseConsumersPerShard := b.config.NumConsumers / b.config.StreamShards
-	extraConsumers := b.config.NumConsumers % b.config.StreamShards
+	base := b.config.NumConsumers / b.config.StreamShards
+	extra := b.config.NumConsumers % b.config.StreamShards
 	for shardID := 0; shardID < b.config.StreamShards; shardID++ {
-		if shardID < extraConsumers {
-			consumersPerShard[shardID] = baseConsumersPerShard + 1
+		if shardID < extra {
+			consumersPerShard[shardID] = base + 1
 		} else {
-			consumersPerShard[shardID] = baseConsumersPerShard
+			consumersPerShard[shardID] = base
 		}
 	}
 
-	log.Debug().
-		Int("total_consumers", b.config.NumConsumers).
-		Int("shards", b.config.StreamShards).
-		Interface("consumers_per_shard", consumersPerShard).
-		Msg("Distributing consumers across shards")
-
-	// Start consumers for each shard
-	consumerCounter := 0
 	for shardID, topics := range shardToTopics {
-		numConsumersForShard := consumersPerShard[shardID]
-		if numConsumersForShard <= 0 {
+		numConsumers := consumersPerShard[shardID]
+		if numConsumers <= 0 {
 			continue
 		}
+		tpp := (len(topics) + numConsumers - 1) / numConsumers
 
-		// Calculate topics per consumer for this shard
-		topicsPerConsumer := (len(topics) + numConsumersForShard - 1) / numConsumersForShard
-		for c := 0; c < numConsumersForShard; c++ {
-			b.consumerWg.Add(1)
-
-			// Calculate topic range for this consumer within the shard
-			startIdx := c * topicsPerConsumer
-			endIdx := (c + 1) * topicsPerConsumer
-			if endIdx > len(topics) {
-				endIdx = len(topics)
+		for c := 0; c < numConsumers; c++ {
+			start := c * tpp
+			end := (c + 1) * tpp
+			if end > len(topics) {
+				end = len(topics)
 			}
-
-			// Skip if no topics assigned to this consumer
-			if startIdx >= len(topics) {
-				b.consumerWg.Done()
-				continue
-			}
-
-			// Get topics for this consumer within this shard
-			consumerTopics := topics[startIdx:endIdx]
+			consumerTopics := topics[start:end]
 			if len(consumerTopics) == 0 {
-				b.consumerWg.Done()
 				continue
 			}
 
-			globalConsumerID := consumerCounter
-			consumerCounter++
-
-			go func(consumerID int, shardID int, consumerTopics []string) {
+			b.consumerWg.Add(1)
+			go func(shardID int, consumerTopics []string, consumerID int) {
 				defer b.consumerWg.Done()
-				streamName := fmt.Sprintf("%s-%d", b.config.StreamPrefix, shardID)
-				log.Debug().
-					Int("consumer_id", consumerID).
-					Int("shard_id", shardID).
-					Int("topics_count", len(consumerTopics)).
-					Strs("topics", consumerTopics).
-					Msg("Creating stream consumer")
 
-				// Create an ephemeral pull consumer with a filter subject array
+				nc, err := nats.Connect(b.config.NatsURL, nats.UserInfo(b.config.NATSUser, b.config.NATSPassword))
+				if err != nil {
+					log.Error().Err(err).Int("consumer_id", consumerID).Msg("Failed to create NATS connection")
+					return
+				}
+				defer nc.Close()
+
+				domain := b.topicToDomain[consumerTopics[0]].Options().Domain
+				js, err := jetstream.NewWithDomain(nc, domain)
+				if err != nil {
+					log.Error().Err(err).Str("domain", domain).Msg("Failed to init JS domain")
+					return
+				}
+
+				streamName := fmt.Sprintf("%s-%d", b.config.StreamPrefix, shardID)
 				consumerConfig := jetstream.ConsumerConfig{
-					AckPolicy:     jetstream.AckExplicitPolicy,
-					AckWait:       30 * time.Second,
-					MaxAckPending: 10000,
-					DeliverPolicy: jetstream.DeliverAllPolicy,
-					//	DeliverPolicy:  jetstream.DeliverLastPerSubjectPolicy,
-					FilterSubjects: consumerTopics, // Use assigned topics for this consumer
-					MaxDeliver:     1,              // Only deliver once
+					AckPolicy:      jetstream.AckExplicitPolicy,
+					AckWait:        30 * time.Second,
+					MaxAckPending:  10000,
+					DeliverPolicy:  jetstream.DeliverAllPolicy,
+					FilterSubjects: consumerTopics,
+					MaxDeliver:     1,
 					ReplayPolicy:   jetstream.ReplayInstantPolicy,
-					// No Durable name for ephemeral consumer
 				}
 
 				ctx, cancel := context.WithTimeout(context.Background(), b.config.RequestTimeout)
-
-				jsWithDomain := b.jsDomains[shardID%b.config.NumDomains]
-
-				consumer, err := jsWithDomain.CreateOrUpdateConsumer(
-					ctx,
-					streamName,
-					consumerConfig,
-				)
+				consumer, err := js.CreateOrUpdateConsumer(ctx, streamName, consumerConfig)
 				cancel()
-
 				if err != nil {
-					log.Fatal().Err(err).
-						Int("consumer_id", consumerID).
-						Int("shard_id", shardID).
-						Int("topic_count", len(consumerTopics)).
-						Msg("Failed to create consumer")
+					log.Error().Err(err).Int("consumer_id", consumerID).Msg("Failed to create consumer")
+					return
 				}
 
-				log.Debug().
-					Int("consumer_id", consumerID).
-					Int("shard_id", shardID).
-					Int("topic_count", len(consumerTopics)).
-					Msg("Stream consumer created")
-
-				// Process messages until benchmark is done
 				for {
 					select {
 					case <-b.done:
 						return
 					default:
-						// Fetch messages in batches for efficiency
 						msgs, err := consumer.Fetch(b.config.ConsumeBatchSize)
 						if err != nil {
 							if err != context.DeadlineExceeded && err != nats.ErrTimeout {
-								log.Error().
-									Err(err).
-									Int("consumer_id", consumerID).
-									Int("shard_id", shardID).
-									Msg("Error fetching messages")
+								log.Error().Err(err).Int("consumer_id", consumerID).Msg("Fetch error")
 							}
-							time.Sleep(10 * time.Millisecond) // Small sleep to prevent CPU spinning
+							time.Sleep(10 * time.Millisecond)
 							continue
 						}
 
-						// Process messages
 						for msg := range msgs.Messages() {
-							// Record message reception
 							atomic.AddInt64(&b.messagesReceived, 1)
 							atomic.AddInt64(&b.bytesReceived, int64(len(msg.Data())))
 
-							// Calculate latency using message metadata
 							meta, err := msg.Metadata()
 							if err == nil && meta != nil {
-								// Calculate latency using the message timestamp
-								readLatency := time.Since(meta.Timestamp)
-								b.recordReadLatency(readLatency)
+								b.recordReadLatency(time.Since(meta.Timestamp))
 							} else if sentTimeStr := msg.Headers().Get("X-Sent-Time"); sentTimeStr != "" && b.config.LatencyFromXSentTime {
 								if sentTime, err := time.Parse(time.RFC3339Nano, sentTimeStr); err == nil {
-									readLatency := time.Since(sentTime)
-									b.recordReadLatency(readLatency)
-
-									log.Warn().
-										Dur("read_latency", readLatency).
-										Str("subject", msg.Subject()).
-										Int("consumer_id", consumerID).
-										Msg("Calculated read latency from X-Sent-Time header")
-								} else {
-									log.Warn().
-										Err(err).
-										Str("subject", msg.Subject()).
-										Int("consumer_id", consumerID).
-										Msg("Failed to parse sent time from X-Sent-Time header")
+									b.recordReadLatency(time.Since(sentTime))
 								}
 							}
 
-							// Acknowledge message
 							if err := msg.Ack(); err != nil {
-								log.Warn().
-									Err(err).
-									Str("subject", msg.Subject()).
-									Int("consumer_id", consumerID).
-									Msg("Failed to acknowledge message")
+								log.Warn().Err(err).Str("subject", msg.Subject()).Int("consumer_id", consumerID).Msg("Ack failed")
 							}
 						}
 					}
 				}
-			}(globalConsumerID, shardID, consumerTopics)
+			}(shardID, consumerTopics, c)
 		}
 	}
 }
@@ -638,21 +568,27 @@ func (b *Benchmark) startProducers(topicNames []string) {
 
 			producerTopics := topicNames[startIdx:endIdx]
 
-			log.Debug().
-				Int("producer_id", producerID).
-				Int("topics", len(producerTopics)).
-				Msg("Producer started")
-
-			tickers := make([]*time.Ticker, len(producerTopics))
-			for i := range producerTopics {
-				interval := time.Second / time.Duration(b.config.MessageRate)
-				tickers[i] = time.NewTicker(interval)
+			// Set up per-producer NATS connection
+			nc, err := nats.Connect(b.config.NatsURL, nats.UserInfo(b.config.NATSUser, b.config.NATSPassword))
+			if err != nil {
+				log.Error().Err(err).Int("producer_id", producerID).Msg("Failed to create NATS connection")
+				return
 			}
-			defer func() {
-				for _, t := range tickers {
-					t.Stop()
+			defer nc.Close()
+
+			// Create domain-specific JetStream contexts per producer
+			producerDomains := make(map[string]jetstream.JetStream)
+			for _, topic := range producerTopics {
+				js := b.topicToDomain[topic]
+				domain := js.Options().Domain
+				if _, ok := producerDomains[domain]; !ok {
+					producerDomains[domain], err = jetstream.NewWithDomain(nc, domain)
+					if err != nil {
+						log.Error().Err(err).Str("domain", domain).Int("producer_id", producerID).Msg("Failed to init JS domain")
+						return
+					}
 				}
-			}()
+			}
 
 			type asyncPublishTracker struct {
 				sendTime  time.Time
@@ -661,88 +597,52 @@ func (b *Benchmark) startProducers(topicNames []string) {
 				processed bool
 			}
 			var pendingPublishes []asyncPublishTracker
+			lastSent := make(map[string]time.Time)
 			currentBatchSize := 0
+			ticker := time.NewTicker(time.Millisecond * 10)
+			defer ticker.Stop()
+			i := 0
 
 			for {
 				select {
 				case <-b.done:
-					if !b.config.PubSync && len(pendingPublishes) > 0 {
-						unprocessed := map[jetstream.JetStream][]*asyncPublishTracker{}
-						for i := range pendingPublishes {
-							if !pendingPublishes[i].processed {
-								js := b.topicToDomain[pendingPublishes[i].topic]
-								unprocessed[js] = append(unprocessed[js], &pendingPublishes[i])
-							}
-						}
-
-						for js, list := range unprocessed {
-							ctx, cancel := context.WithTimeout(context.Background(), b.config.RequestTimeout)
-							select {
-							case <-js.PublishAsyncComplete():
-								for _, pub := range list {
-									select {
-									case <-pub.future.Ok():
-										b.recordWriteLatency(time.Since(pub.sendTime))
-										atomic.AddInt64(&b.messagesSent, 1)
-										atomic.AddInt64(&b.bytesSent, int64(b.config.MessageSize))
-										pub.processed = true
-									case err := <-pub.future.Err():
-										log.Error().Err(err).Str("topic", pub.topic).Msg("Final async publish error")
-										pub.processed = true
-									default:
-										log.Warn().Str("topic", pub.topic).Msg("Future not ready despite completion")
-									}
-								}
-							case <-ctx.Done():
-								log.Warn().Int("producer_id", producerID).Msg("Timeout waiting for async publish completion")
-							}
-							cancel()
-						}
-					}
 					return
-
-				default:
-					published := false
-					for i, topic := range producerTopics {
-						select {
-						case <-tickers[i].C:
-							published = true
-							sendTime := time.Now()
-							msg := &nats.Msg{
-								Subject: topic,
-								Header:  nats.Header{"X-Sent-Time": []string{sendTime.Format(time.RFC3339Nano)}},
-								Data:    msgData,
-							}
-
-							js := b.topicToDomain[topic]
-
-							if b.config.PubSync {
-								ctx, cancel := context.WithTimeout(context.Background(), b.config.RequestTimeout)
-								_, err := js.PublishMsg(ctx, msg)
-								cancel()
-								if err != nil {
-									log.Error().Err(err).Str("topic", topic).Msg("Sync publish failed")
-								} else {
-									b.recordWriteLatency(time.Since(sendTime))
-									atomic.AddInt64(&b.messagesSent, 1)
-									atomic.AddInt64(&b.bytesSent, int64(b.config.MessageSize))
-								}
-							} else {
-								future, err := js.PublishMsgAsync(msg)
-								if err != nil {
-									log.Error().Err(err).Str("topic", topic).Msg("Async publish failed")
-								} else {
-									pendingPublishes = append(pendingPublishes, asyncPublishTracker{
-										sendTime: sendTime, topic: topic, future: future,
-									})
-									currentBatchSize++
-								}
-							}
-						default:
-						}
+				case <-ticker.C:
+					topic := producerTopics[i%len(producerTopics)]
+					i++
+					interval := time.Second / time.Duration(b.config.MessageRate)
+					if time.Since(lastSent[topic]) < interval {
+						continue
 					}
+					lastSent[topic] = time.Now()
 
-					if !b.config.PubSync && currentBatchSize >= b.config.BatchSize {
+					headers := nats.Header{"X-Sent-Time": []string{time.Now().Format(time.RFC3339Nano)}}
+					msg := &nats.Msg{Subject: topic, Header: headers, Data: msgData}
+					js := producerDomains[b.topicToDomain[topic].Options().Domain]
+
+					if b.config.PubSync {
+						ctx, cancel := context.WithTimeout(context.Background(), b.config.RequestTimeout)
+						_, err := js.PublishMsg(ctx, msg)
+						cancel()
+						if err != nil {
+							log.Error().Err(err).Str("topic", topic).Msg("Sync publish failed")
+							continue
+						}
+						b.recordWriteLatency(time.Since(lastSent[topic]))
+						atomic.AddInt64(&b.messagesSent, 1)
+						atomic.AddInt64(&b.bytesSent, int64(b.config.MessageSize))
+					} else {
+						future, err := js.PublishMsgAsync(msg)
+						if err != nil {
+							log.Error().Err(err).Str("topic", topic).Msg("Async publish failed")
+							continue
+						}
+						pendingPublishes = append(pendingPublishes, asyncPublishTracker{
+							sendTime: lastSent[topic], topic: topic, future: future,
+						})
+						currentBatchSize++
+					}
+					if currentBatchSize >= b.config.BatchSize {
 						for i := range pendingPublishes {
 							if pendingPublishes[i].processed {
 								continue
@@ -757,14 +657,11 @@ func (b *Benchmark) startProducers(topicNames []string) {
 								log.Error().Err(err).Str("topic", pendingPublishes[i].topic).Msg("Async publish error")
 								pendingPublishes[i].processed = true
 							default:
+								// Not ready yet
 							}
 						}
 						pendingPublishes = pendingPublishes[:0]
 						currentBatchSize = 0
-					}
-
-					if !published {
-						runtime.Gosched()
 					}
 				}
 			}
