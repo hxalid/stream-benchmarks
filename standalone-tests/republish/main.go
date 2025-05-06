@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"runtime/pprof"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -61,6 +62,7 @@ func main() {
 	natsURL := flag.String("nats", "nats://nats:4222", "NATS server URL")
 	natsUser := flag.String("natsUser", "benchmark", "NATS server user")
 	natsPassword := flag.String("natsPassword", "benchmarkbenchmarkbenchmark", "NATS server password")
+	profile := flag.String("profile", "", "Enables the provided profile")
 	pubSync := flag.Bool("pubSync", false, "Enables sync publishers")
 	pendingMsg := flag.Bool("pendingMsg", true, "Prints pending message counts")
 	requestTimeout := flag.Duration("timeout", 60*time.Second, "Request timeout duration")
@@ -76,6 +78,37 @@ func main() {
 	// Setup logging
 	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: time.RFC3339})
 	zerolog.SetGlobalLevel(zerolog.InfoLevel)
+
+	if *profile != "" {
+		f, err := os.Create(fmt.Sprintf("%s.prof", *profile))
+		if err != nil {
+			log.Fatal().Msgf("could not create %s profile: %v", *profile, err)
+		}
+		defer f.Close()
+
+		switch *profile {
+		case "cpu":
+			if err := pprof.StartCPUProfile(f); err != nil {
+				log.Fatal().Msgf("could not start CPU profile: %v", err)
+			}
+			defer pprof.StopCPUProfile()
+		case "memory":
+			runtime.GC() // get up-to-date statistics
+			if err := pprof.WriteHeapProfile(f); err != nil {
+				log.Fatal().Msgf("could not write memory profile: %v", err)
+			}
+		case "goroutine":
+			if err := pprof.Lookup("goroutine").WriteTo(f, 1); err != nil {
+				log.Fatal().Msgf("could not write goroutine profile: %v", err)
+			}
+		case "block":
+			if err := pprof.Lookup("block").WriteTo(f, 1); err != nil {
+				log.Fatal().Msgf("could not write block profile: %v", err)
+			}
+		default:
+			log.Fatal().Msgf("unknown profile type: %s", *profile)
+		}
+	}
 
 	// Create benchmark configuration
 	config := Config{
@@ -201,7 +234,7 @@ func (b *Benchmark) Setup() error {
 
 	newJS, err := jetstream.New(
 		nc,
-		jetstream.WithPublishAsyncMaxPending(1024),
+		jetstream.WithPublishAsyncMaxPending(10000),
 	)
 	if err != nil {
 		return fmt.Errorf("failed to create a Jetstream instance: %w", err)

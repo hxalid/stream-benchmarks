@@ -28,6 +28,7 @@ type Config struct {
 	MessageMaxAge        time.Duration
 	MessageRate          int // Target message rate per subject
 	MessageSize          int // Message size in bytes
+	NumDomains           int // Number of JetStream domains to use
 	EnableConsumers      bool
 	Duration             time.Duration // Benchmark duration
 	LatencyFromXSentTime bool
@@ -39,6 +40,7 @@ type Config struct {
 	Replicas             int // Number of replicas
 	RetentionPolicy      int
 	Storage              int
+	ServerShardID        int
 	StreamPrefix         string // Stream name prefix
 	StreamShards         int    // Number of stream shards
 	RequestTimeout       time.Duration
@@ -58,13 +60,15 @@ func main() {
 	duration := flag.Duration("duration", 5*time.Minute, "Benchmark duration")
 	latencyFromXSentTime := flag.Bool("latencyFromXSentTime", false, "Whether to calculate the read latency from X-Sent-Time header")
 	natsURL := flag.String("nats", "nats://nats:4222", "NATS server URL")
-	natsUser := flag.String("natsUser", "benchmark", "NATS server user")
-	natsPassword := flag.String("natsPassword", "benchmarkbenchmarkbenchmark", "NATS server password")
+	natsUser := flag.String("natsUser", "", "NATS server user")
+	natsPassword := flag.String("natsPassword", "", "NATS server password")
+	numDomains := flag.Int("domains", 3, "Number of JetStream domains to use")
 	pubSync := flag.Bool("pubSync", false, "Enables sync publishers")
 	pendingMsg := flag.Bool("pendingMsg", false, "Prints pending message counts")
 	requestTimeout := flag.Duration("timeout", 60*time.Second, "Request timeout duration")
 	replicas := flag.Int("replicas", 3, "Number of stream replicas")
 	retentionPolicy := flag.Int("retention", 0, "Stream retention policy; 0 - limit, 1 - workqueue")
+	serverShardID := flag.Int("serverShardID", 0, "The server shard ID")
 	storage := flag.Int("storage", 0, "Jetstream storage type; 0 - file, 1- memory")
 	streamPrefix := flag.String("prefix", "benchmark", "Stream name prefix")
 	streamShards := flag.Int("shards", 2, "Number of stream shards")
@@ -91,11 +95,13 @@ func main() {
 		NatsURL:              *natsURL,
 		NATSUser:             *natsUser,
 		NATSPassword:         *natsPassword,
+		NumDomains:           *numDomains,
 		PrintPendingMessages: *pendingMsg,
 		PubSync:              *pubSync,
 		RequestTimeout:       *requestTimeout,
 		Replicas:             *replicas,
 		RetentionPolicy:      *retentionPolicy,
+		ServerShardID:        *serverShardID,
 		Storage:              *storage,
 		StreamPrefix:         *streamPrefix,
 		StreamShards:         *streamShards,
@@ -131,7 +137,7 @@ func main() {
 type Benchmark struct {
 	config           Config
 	nc               *nats.Conn
-	js               jetstream.JetStream
+	jsDomains        []jetstream.JetStream
 	messagesSent     int64
 	messagesReceived int64
 	bytesSent        int64
@@ -144,6 +150,7 @@ type Benchmark struct {
 	wg               sync.WaitGroup
 	done             chan struct{}
 	startTime        time.Time
+	topicToDomain    map[string]jetstream.JetStream
 }
 
 // NewBenchmark creates a new benchmark instance
@@ -153,6 +160,7 @@ func NewBenchmark(config Config) *Benchmark {
 		writeLatencies: make([]time.Duration, 0, 10000),
 		readLatencies:  make([]time.Duration, 0, 10000),
 		done:           make(chan struct{}),
+		jsDomains:      make([]jetstream.JetStream, config.NumDomains),
 	}
 }
 
@@ -161,11 +169,33 @@ func (b *Benchmark) generateTopicNames() []string {
 	topics := make([]string, b.config.Concurrency)
 	for i := 0; i < b.config.Concurrency; i++ {
 		shardID := i % b.config.StreamShards
-		topics[i] = fmt.Sprintf("%s.shard.%d.topic.%d", b.config.StreamPrefix, shardID, i)
+		topics[i] = fmt.Sprintf("%s.shard.%d.topic.%d", b.config.StreamPrefix, shardID, i+b.config.ServerShardID*b.config.Concurrency)
 	}
 	return topics
 }
 
+func (b *Benchmark) buildTopicToDomainMap(topics []string) {
+	b.topicToDomain = make(map[string]jetstream.JetStream, len(topics))
+	for _, topic := range topics {
+		var shardID int
+		_, err := fmt.Sscanf(topic, b.config.StreamPrefix+".shard.%d.", &shardID)
+		if err != nil {
+			log.Fatal().Err(err).Str("topic", topic).Msg("Failed to parse shard ID from topic name")
+		}
+
+		domainID := shardID % b.config.NumDomains
+		if domainID >= len(b.jsDomains) {
+			log.Fatal().
+				Int("domain_id", domainID).
+				Int("total_domains", len(b.jsDomains)).
+				Msg("Domain ID exceeds available JetStream domains")
+		}
+
+		b.topicToDomain[topic] = b.jsDomains[domainID]
+	}
+}
+
+// Setup prepares the benchmark environment
 func (b *Benchmark) Setup() error {
 	// Connect to NATS
 	opts := []nats.Option{
@@ -191,15 +221,14 @@ func (b *Benchmark) Setup() error {
 
 	b.nc = nc
 
-	newJS, err := jetstream.New(
-		nc,
-		//jetstream.WithPublishAsyncMaxPending(10000), // TODO: tune this
-	)
-	if err != nil {
-		return fmt.Errorf("failed to create a Jetstream instance: %w", err)
+	for i := 0; i < b.config.NumDomains; i++ {
+		domainName := fmt.Sprintf("c%d", i)
+		js, err := jetstream.NewWithDomain(nc, domainName)
+		if err != nil {
+			return fmt.Errorf("failed to create JetStream for domain %s: %w", domainName, err)
+		}
+		b.jsDomains[i] = js
 	}
-
-	b.js = newJS
 
 	// Create stream shards with wildcard subjects
 	if err := b.createStreamShards(); err != nil {
@@ -225,8 +254,9 @@ func (b *Benchmark) createStreamShards() error {
 			Subjects:  []string{subjectPattern},
 		}
 
-		// Create or update stream
-		_, err := b.js.CreateStream(context.Background(), jsCfg)
+		js := b.jsDomains[i%b.config.NumDomains]
+		_, err := js.CreateStream(context.Background(), jsCfg)
+
 		if err != nil {
 			return fmt.Errorf("failed to create stream %s: %w", streamName, err)
 		}
@@ -246,6 +276,27 @@ func (b *Benchmark) Cleanup() {
 func (b *Benchmark) Run() error {
 	// Generate topic names
 	topicNames := b.generateTopicNames()
+
+	b.buildTopicToDomainMap(topicNames)
+
+	domainTopicCounts := make(map[string]int)
+
+	for topic, js := range b.topicToDomain {
+		domain := js.Options().Domain
+		domainTopicCounts[domain]++
+
+		log.Debug().
+			Str("topic", topic).
+			Str("domain", domain).
+			Msg("Mapped topic to domain")
+	}
+
+	for domain, count := range domainTopicCounts {
+		log.Info().
+			Str("domain", domain).
+			Int("topic_count", count).
+			Msg("Total topics for domain")
+	}
 
 	// Log benchmark parameters
 	log.Info().
@@ -311,6 +362,7 @@ func (b *Benchmark) Run() error {
 	return nil
 }
 
+// startStatsReporter starts a goroutine that periodically reports benchmark stats
 func (b *Benchmark) startStatsReporter() {
 	b.wg.Add(1)
 	go func() {
@@ -346,7 +398,11 @@ func (b *Benchmark) startStatsReporter() {
 
 				pendingMsgCount := 0
 				if b.config.PrintPendingMessages {
-					pendingMsgCount = b.js.PublishAsyncPending()
+					for i, js := range b.jsDomains {
+						count := js.PublishAsyncPending()
+						log.Debug().Int("domain", i).Int("pending", count).Msg("Pending messages in domain")
+						pendingMsgCount += count
+					}
 				}
 
 				log.Info().
@@ -466,7 +522,10 @@ func (b *Benchmark) startConsumers(topicNames []string) {
 				}
 
 				ctx, cancel := context.WithTimeout(context.Background(), b.config.RequestTimeout)
-				consumer, err := b.js.CreateOrUpdateConsumer(
+
+				jsWithDomain := b.jsDomains[shardID%b.config.NumDomains]
+
+				consumer, err := jsWithDomain.CreateOrUpdateConsumer(
 					ctx,
 					streamName,
 					consumerConfig,
@@ -554,45 +613,36 @@ func (b *Benchmark) startConsumers(topicNames []string) {
 	}
 }
 
+// startProducers starts producer goroutines
 func (b *Benchmark) startProducers(topicNames []string) {
-	// Prepare message data
 	msgData := make([]byte, b.config.MessageSize)
 	for i := range msgData {
 		msgData[i] = byte(i % 256)
 	}
 
-	// Calculate how many topics each producer handles
 	topicsPerProducer := (b.config.Concurrency + b.config.NumProducers - 1) / b.config.NumProducers
 
-	// Start producer goroutines
 	for p := 0; p < b.config.NumProducers; p++ {
 		b.producerWg.Add(1)
 		go func(producerID int) {
 			defer b.producerWg.Done()
 
-			// Calculate topic range for this producer
 			startIdx := producerID * topicsPerProducer
 			endIdx := (producerID + 1) * topicsPerProducer
 			if endIdx > b.config.Concurrency {
 				endIdx = b.config.Concurrency
 			}
-
-			// Skip if no topics
-			if startIdx >= b.config.Concurrency || startIdx >= len(topicNames) {
+			if startIdx >= len(topicNames) {
 				return
 			}
 
-			// Get topics for this producer
 			producerTopics := topicNames[startIdx:endIdx]
 
 			log.Debug().
 				Int("producer_id", producerID).
 				Int("topics", len(producerTopics)).
-				Int("start_idx", startIdx).
-				Int("end_idx", endIdx).
 				Msg("Producer started")
 
-			// Create rate limiters for each topic
 			tickers := make([]*time.Ticker, len(producerTopics))
 			for i := range producerTopics {
 				interval := time.Second / time.Duration(b.config.MessageRate)
@@ -604,236 +654,116 @@ func (b *Benchmark) startProducers(topicNames []string) {
 				}
 			}()
 
-			// Track async publishes for proper acknowledgment handling
 			type asyncPublishTracker struct {
 				sendTime  time.Time
 				topic     string
 				future    jetstream.PubAckFuture
-				processed bool // Flag to track if this publish has been processed already
+				processed bool
 			}
-
-			// Use a slice for current batch messages
+			var pendingPublishes []asyncPublishTracker
 			currentBatchSize := 0
-			pendingPublishes := make([]asyncPublishTracker, 0, b.config.BatchSize)
 
-			// Main producer loop
 			for {
 				select {
 				case <-b.done:
-					// When shutting down, ensure all pending async publishes complete
 					if !b.config.PubSync && len(pendingPublishes) > 0 {
-						// Only process unprocessed publishes
-						unprocessedCount := 0
+						unprocessed := map[jetstream.JetStream][]*asyncPublishTracker{}
 						for i := range pendingPublishes {
 							if !pendingPublishes[i].processed {
-								unprocessedCount++
+								js := b.topicToDomain[pendingPublishes[i].topic]
+								unprocessed[js] = append(unprocessed[js], &pendingPublishes[i])
 							}
 						}
-						if unprocessedCount > 0 {
-							log.Debug().
-								Int("producer_id", producerID).
-								Int("remaining_publishes", unprocessedCount).
-								Msg("Processing remaining publishes before exit")
-							ctx, cancel := context.WithTimeout(context.Background(), b.config.RequestTimeout)
-							defer cancel()
-							select {
-							case <-b.js.PublishAsyncComplete():
-								// Process all remaining unprocessed acknowledgments
-								for i := range pendingPublishes {
-									if pendingPublishes[i].processed || pendingPublishes[i].future == nil {
-										continue // Skip already processed ones
-									}
-									select {
-									case <-pendingPublishes[i].future.Ok():
-										// Record round-trip latency
-										ackLatency := time.Since(pendingPublishes[i].sendTime)
-										b.recordWriteLatency(ackLatency)
 
-										// Count the message
+						for js, list := range unprocessed {
+							ctx, cancel := context.WithTimeout(context.Background(), b.config.RequestTimeout)
+							select {
+							case <-js.PublishAsyncComplete():
+								for _, pub := range list {
+									select {
+									case <-pub.future.Ok():
+										b.recordWriteLatency(time.Since(pub.sendTime))
 										atomic.AddInt64(&b.messagesSent, 1)
 										atomic.AddInt64(&b.bytesSent, int64(b.config.MessageSize))
-
-										pendingPublishes[i].processed = true
-
-										log.Debug().
-											Dur("ack_latency", ackLatency).
-											Str("topic", pendingPublishes[i].topic).
-											Msg("Final publish acknowledged")
-									case err := <-pendingPublishes[i].future.Err():
-										log.Error().
-											Err(err).
-											Str("topic", pendingPublishes[i].topic).
-											Msg("Final publish error")
-
-										pendingPublishes[i].processed = true
+										pub.processed = true
+									case err := <-pub.future.Err():
+										log.Error().Err(err).Str("topic", pub.topic).Msg("Final async publish error")
+										pub.processed = true
 									default:
-										// Should not happen since PublishAsyncComplete signaled
-										log.Warn().
-											Str("topic", pendingPublishes[i].topic).
-											Msg("Publish future not ready despite completion signal")
+										log.Warn().Str("topic", pub.topic).Msg("Future not ready despite completion")
 									}
 								}
 							case <-ctx.Done():
-								log.Warn().
-									Int("producer_id", producerID).
-									Int("unprocessed", unprocessedCount).
-									Msg("Timeout waiting for final async publishes")
+								log.Warn().Int("producer_id", producerID).Msg("Timeout waiting for async publish completion")
 							}
+							cancel()
 						}
 					}
 					return
+
 				default:
-					publishedThisIteration := false
-					// Check each topic's ticker
+					published := false
 					for i, topic := range producerTopics {
 						select {
 						case <-tickers[i].C:
-							// It's time to send a message to this topic
-							publishedThisIteration = true
+							published = true
 							sendTime := time.Now()
-							header := nats.Header{}
-							header.Set("X-Sent-Time", sendTime.Format(time.RFC3339Nano))
 							msg := &nats.Msg{
 								Subject: topic,
-								Header:  header,
+								Header:  nats.Header{"X-Sent-Time": []string{sendTime.Format(time.RFC3339Nano)}},
 								Data:    msgData,
 							}
 
+							js := b.topicToDomain[topic]
+
 							if b.config.PubSync {
-								// Synchronous publish with timeout
 								ctx, cancel := context.WithTimeout(context.Background(), b.config.RequestTimeout)
-								_, err := b.js.PublishMsg(ctx, msg)
+								_, err := js.PublishMsg(ctx, msg)
 								cancel()
-
 								if err != nil {
-									log.Error().Err(err).Str("topic", topic).Msg("Failed to publish message")
+									log.Error().Err(err).Str("topic", topic).Msg("Sync publish failed")
 								} else {
-									// For sync publishing, write latency includes the full round trip
-									writeLatency := time.Since(sendTime)
-									b.recordWriteLatency(writeLatency)
-
-									// Count the message
+									b.recordWriteLatency(time.Since(sendTime))
 									atomic.AddInt64(&b.messagesSent, 1)
 									atomic.AddInt64(&b.bytesSent, int64(b.config.MessageSize))
 								}
 							} else {
-								// Asynchronous batch publish
-								future, err := b.js.PublishMsgAsync(msg)
+								future, err := js.PublishMsgAsync(msg)
 								if err != nil {
-									log.Error().Err(err).Str("topic", topic).Msg("Failed to publish async message")
+									log.Error().Err(err).Str("topic", topic).Msg("Async publish failed")
 								} else {
-									// Add to pending publishes for later acknowledgment handling
 									pendingPublishes = append(pendingPublishes, asyncPublishTracker{
-										sendTime:  sendTime,
-										topic:     topic,
-										future:    future,
-										processed: false,
+										sendTime: sendTime, topic: topic, future: future,
 									})
 									currentBatchSize++
 								}
 							}
 						default:
-							// Not time to send for this topic
 						}
 					}
 
-					// Handle batch completion for async publishing
-					if !b.config.PubSync && currentBatchSize >= b.config.BatchSize && len(pendingPublishes) > 0 {
-						publishedThisIteration = true
-
-						// First check if any futures are already ready
+					if !b.config.PubSync && currentBatchSize >= b.config.BatchSize {
 						for i := range pendingPublishes {
 							if pendingPublishes[i].processed {
-								continue // Skip already processed ones
+								continue
 							}
-
-							// Try to get the acknowledgment without waiting
 							select {
 							case <-pendingPublishes[i].future.Ok():
-								// Record full round-trip latency
-								ackLatency := time.Since(pendingPublishes[i].sendTime)
-								b.recordWriteLatency(ackLatency)
-
-								// Count the message
+								b.recordWriteLatency(time.Since(pendingPublishes[i].sendTime))
 								atomic.AddInt64(&b.messagesSent, 1)
 								atomic.AddInt64(&b.bytesSent, int64(b.config.MessageSize))
-
-								// Mark as processed
 								pendingPublishes[i].processed = true
-
 							case err := <-pendingPublishes[i].future.Err():
-								log.Error().
-									Err(err).
-									Str("topic", pendingPublishes[i].topic).
-									Msg("Async publish error")
-
-								// Mark as processed even on error
+								log.Error().Err(err).Str("topic", pendingPublishes[i].topic).Msg("Async publish error")
 								pendingPublishes[i].processed = true
-
 							default:
-								// Not ready yet, will be handled after PublishAsyncComplete
 							}
 						}
-
-						// Count how many are still unprocessed
-						unprocessedCount := 0
-						for i := range pendingPublishes {
-							if !pendingPublishes[i].processed {
-								unprocessedCount++
-							}
-						}
-
-						// If some are still unprocessed, wait for completion
-						if unprocessedCount > 0 {
-							ctx, cancel := context.WithTimeout(context.Background(), b.config.RequestTimeout)
-							select {
-							case <-b.js.PublishAsyncComplete():
-								// Process remaining unprocessed acknowledgments
-								for i := range pendingPublishes {
-									if pendingPublishes[i].processed {
-										continue // Skip already processed ones
-									}
-
-									select {
-									case <-pendingPublishes[i].future.Ok():
-										ackLatency := time.Since(pendingPublishes[i].sendTime)
-										b.recordWriteLatency(ackLatency)
-
-										// Count the message
-										atomic.AddInt64(&b.messagesSent, 1)
-										atomic.AddInt64(&b.bytesSent, int64(b.config.MessageSize))
-
-										pendingPublishes[i].processed = true
-
-									case err := <-pendingPublishes[i].future.Err():
-										log.Error().
-											Err(err).
-											Str("topic", pendingPublishes[i].topic).
-											Msg("Async publish error")
-
-										pendingPublishes[i].processed = true
-
-									default:
-										// Should not happen after PublishAsyncComplete
-										log.Warn().
-											Str("topic", pendingPublishes[i].topic).
-											Msg("Future not ready after PublishAsyncComplete")
-									}
-								}
-							case <-ctx.Done():
-								log.Warn().
-									Int("unprocessed_count", unprocessedCount).
-									Msg("Timeout waiting for publish acknowledgments")
-							}
-							cancel()
-						}
-
-						// Reset for next batch
 						pendingPublishes = pendingPublishes[:0]
 						currentBatchSize = 0
 					}
-					// If we didn't publish anything this iteration, yield the CPU briefly
-					if !publishedThisIteration {
+
+					if !published {
 						runtime.Gosched()
 					}
 				}
@@ -842,6 +772,7 @@ func (b *Benchmark) startProducers(topicNames []string) {
 	}
 }
 
+// formatDuration formats a duration in milliseconds with 3 decimal places
 func formatDuration(d time.Duration) string {
 	return fmt.Sprintf("%.3f ms", float64(d)/float64(time.Millisecond))
 }
