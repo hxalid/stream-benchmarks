@@ -660,36 +660,7 @@ func (b *Benchmark) startProducers(topicNames []string) {
 			}
 			var pendingPublishesMu sync.Mutex
 			var pendingPublishes []*asyncPublishTracker
-
-			for _, js := range jsDomains {
-				go func(js jetstream.JetStream) {
-					for {
-						select {
-						case <-js.PublishAsyncComplete():
-							pendingPublishesMu.Lock()
-							for _, pub := range pendingPublishes {
-								if pub.processed {
-									continue
-								}
-								select {
-								case <-pub.future.Ok():
-									b.recordWriteLatency(time.Since(pub.sendTime))
-									atomic.AddInt64(&b.messagesSent, 1)
-									atomic.AddInt64(&b.bytesSent, int64(b.config.MessageSize))
-									pub.processed = true
-								case err := <-pub.future.Err():
-									log.Error().Err(err).Str("topic", pub.topic).Msg("Async publish error")
-									pub.processed = true
-								default:
-								}
-							}
-							pendingPublishesMu.Unlock()
-						case <-b.done:
-							return
-						}
-					}
-				}(js)
-			}
+			currentBatchSize := 0
 
 			tickers := make([]*time.Ticker, len(producerTopics))
 			for i := range producerTopics {
@@ -739,11 +710,42 @@ func (b *Benchmark) startProducers(topicNames []string) {
 									}
 									pendingPublishesMu.Lock()
 									pendingPublishes = append(pendingPublishes, tracker)
+									currentBatchSize++
 									pendingPublishesMu.Unlock()
 								}
 							}
 						default:
 						}
+					}
+
+					if !b.config.PubSync && currentBatchSize >= b.config.BatchSize {
+						ctx, cancel := context.WithTimeout(context.Background(), b.config.RequestTimeout)
+						select {
+						case <-jsDomains[0].PublishAsyncComplete():
+							pendingPublishesMu.Lock()
+							for _, pub := range pendingPublishes {
+								if pub.processed {
+									continue
+								}
+								select {
+								case <-pub.future.Ok():
+									b.recordWriteLatency(time.Since(pub.sendTime))
+									atomic.AddInt64(&b.messagesSent, 1)
+									atomic.AddInt64(&b.bytesSent, int64(b.config.MessageSize))
+									pub.processed = true
+								case err := <-pub.future.Err():
+									log.Error().Err(err).Str("topic", pub.topic).Msg("Async publish error")
+									pub.processed = true
+								default:
+								}
+							}
+							pendingPublishes = pendingPublishes[:0]
+							currentBatchSize = 0
+							pendingPublishesMu.Unlock()
+						case <-ctx.Done():
+							log.Warn().Msg("Timeout waiting for async publish completion")
+						}
+						cancel()
 					}
 					runtime.Gosched()
 				}
